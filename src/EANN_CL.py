@@ -26,6 +26,7 @@ from sklearn.preprocessing import label_binarize
 import scipy.io as sio
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+device="cuda"
 class Rumor_Data(Dataset):
     def __init__(self, dataset):
         self.text = torch.from_numpy(np.array(dataset['post_text']))
@@ -60,6 +61,94 @@ class ReverseLayerF(Function):
 def grad_reverse(x):
     return ReverseLayerF().apply(x)
 
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07, contrast_mode='all',
+                 base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        # print(self.temperature)
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+        # print(self.base_temperature)
+
+    def forward(self, features, labels=None, mask=None):
+        """Compute loss for model. If both `labels` and `mask` are None,
+
+        Args:
+            features: hidden vector of shape [bsz, n_views, ...].
+            labels: ground truth of shape [bsz].
+            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
+                has the same class as sample i. Can be asymmetric.
+        Returns:
+            A loss scalar.
+        """
+        # device = (torch.device('cuda:1')
+        #           if features.is_cuda
+        #           else torch.device('cuda:0'))
+
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...],'
+                             'at least 3 dimensions are required')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        # print(logits_max)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        # print(mean_log_prob_pos)
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
 
 
 # Neural Network Model (1 hidden layer)
@@ -171,11 +260,11 @@ class CNN_Fusion(nn.Module):
         domain_output = self.domain_classifier(reverse_feature)
 
         # ### Multimodal
-        # text_reverse_feature = grad_reverse(text)
-        # image_reverse_feature = grad_reverse(image)
+        #text_reverse_feature = grad_reverse(text)
+        #image_reverse_feature = grad_reverse(image)
         # text_output = self.modal_classifier(text_reverse_feature)
         # image_output = self.modal_classifier(image_reverse_feature
-        return class_output, domain_output
+        return class_output, domain_output,text,image
 
 def to_var(x):
     if torch.cuda.is_available():
@@ -270,7 +359,9 @@ def main(args):
         model.cuda()
 
     # Loss and Optimizer
-    criterion = nn.CrossEntropyLoss()
+    temp = 0.05
+    criterion = SupConLoss(temperature=temp)
+
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, list(model.parameters())),
                                  lr= args.learning_rate)
     #optimizer = torch.optim.RMSprop(filter(lambda p: p.requires_grad, list(model.parameters())),
@@ -311,24 +402,79 @@ def main(args):
             train_text, train_image,  train_mask, train_labels, event_labels = \
                 to_var(train_data[0]), to_var(train_data[1]), to_var(train_data[2]), \
                 to_var(train_labels), to_var(event_labels)
-
+            
             # Forward + Backward + Optimize
             optimizer.zero_grad()
+            
+            class_outputs, domain_outputs,text,img = model(train_text, train_image, train_mask)
+            #encoded_img0 = img[0].to(device=device)   
+            encoded_img1 = img.to(device=device)
+            
+            #print(img.shape,encoded_img1.shape)
+            encoded_text = text
+            #encoded_img0 = encoded_img0 / encoded_img0.norm(dim=-1, keepdim=True) 
+            encoded_img1 = encoded_img1 / encoded_img1.norm(dim=-1, keepdim=True)
+           
 
-            class_outputs, domain_outputs = model(train_text, train_image, train_mask)
 
+            encoded_text = encoded_text / encoded_text.norm(dim=-1, keepdim=True)
+            aug0=[]
+            aug1=[]
+            
+            tex_aug=[]
+
+            real0=[]
+            real1=[]
+            
+            real_text=[]
+
+            for i,label in enumerate(train_labels):
+                # print("I is: ", i )
+                if label==1:
+                    aug0.append(encoded_img1[i])
+                    #aug1.append(encoded_img1[i-1])
+                    
+                    tex_aug.append(encoded_text[i-1])
+                if label==0:
+                    #print(encoded_img1.shape)
+                    real0.append(encoded_img1[i])
+                    #real1.append(encoded_img1[i-1])
+                    
+                    real_text.append(encoded_text[i])
+        
+            aug0=torch.stack(aug0,dim=0)
+            #aug1=torch.stack(aug1,dim=0)
+           
+            tex_aug=torch.stack(tex_aug,dim=0)
+            
+
+
+            real0=torch.stack(real0,dim=0)
+            #real1=torch.stack(real1,dim=0)
+            
+            real_text=torch.stack(real_text,dim=0)
+
+
+            features1 = aug0 #torch.stack([aug0,aug1], dim=1)
+            features2 = tex_aug #torch.stack([tex_aug,tex_aug], dim=1)
+            features3 = torch.stack([real0,real_text], dim=1)
+
+            img_text_aug_feat = torch.cat([features1,features2], dim=0)
+            img_text_aug_feat = img_text_aug_feat.unsqueeze(0)
+            features3 = features3.unsqueeze(0)
+            loss = 1.5*criterion(img_text_aug_feat)  + criterion(features3)
             ## Fake or Real loss
-            class_outputs, train_labels = class_outputs.to("cuda"), train_labels.type(torch.LongTensor).to("cuda")
-            class_loss = criterion(class_outputs, train_labels )
+            #class_outputs, train_labels = class_outputs.to("cuda"), train_labels.type(torch.LongTensor).to("cuda")
+            #class_loss = criterion(class_outputs, train_labels )
             # Event Loss
-            domain_outputs, event_labels = domain_outputs.to("cuda"), event_labels.type(torch.LongTensor).to("cuda")
-            domain_loss = criterion(domain_outputs, event_labels)
-            loss = class_loss + domain_loss
+            #domain_outputs, event_labels = domain_outputs.to("cuda"), event_labels.type(torch.LongTensor).to("cuda")
+            #domain_loss = criterion(domain_outputs, event_labels)
+            #loss = class_loss + domain_loss
             loss.backward()
             optimizer.step()
             _, argmax = torch.max(class_outputs, 1)
 
-            cross_entropy = True
+            #cross_entropy = True
 
             if True:
                 accuracy = (train_labels == argmax.squeeze()).float().mean()
@@ -336,8 +482,8 @@ def main(args):
                 _, labels = torch.max(train_labels, 1)
                 accuracy = (labels.squeeze() == argmax.squeeze()).float().mean()
 
-            class_cost_vector.append(class_loss.item())
-            domain_cost_vector.append(domain_loss.item())
+            #class_cost_vector.append(class_loss.item())
+            #domain_cost_vector.append(domain_loss.item())
             cost_vector.append(loss.item())
             acc_vector.append(accuracy.item())
             # if i == 0:
@@ -357,10 +503,65 @@ def main(args):
             validate_text, validate_image,  validate_mask, validate_labels, event_labels = \
                 to_var(validate_data[0]), to_var(validate_data[1]), to_var(validate_data[2]), \
                 to_var(validate_labels), to_var(event_labels)
-            validate_outputs, domain_outputs = model(validate_text, validate_image, validate_mask)
+            validate_outputs, domain_outputs,text,img = model(validate_text, validate_image, validate_mask)
+            encoded_img1 = img.to(device=device)
+            
+            #print(img.shape,encoded_img1.shape)
+            encoded_text = text
+            #encoded_img0 = encoded_img0 / encoded_img0.norm(dim=-1, keepdim=True) 
+            encoded_img1 = encoded_img1 / encoded_img1.norm(dim=-1, keepdim=True)
+           
+
+
+            encoded_text = encoded_text / encoded_text.norm(dim=-1, keepdim=True)
+            aug0=[]
+            aug1=[]
+            
+            tex_aug=[]
+
+            real0=[]
+            real1=[]
+            
+            real_text=[]
+
+            for i,label in enumerate(validate_labels):
+                # print("I is: ", i )
+                if label==1:
+                    aug0.append(encoded_img1[i])
+                    #aug1.append(encoded_img1[i-1])
+                    
+                    tex_aug.append(encoded_text[i-1])
+                if label==0:
+                    #print(encoded_img1.shape)
+                    real0.append(encoded_img1[i])
+                    #real1.append(encoded_img1[i-1])
+                    
+                    real_text.append(encoded_text[i])
+        
+            aug0=torch.stack(aug0,dim=0)
+            #aug1=torch.stack(aug1,dim=0)
+           
+            tex_aug=torch.stack(tex_aug,dim=0)
+            
+
+
+            real0=torch.stack(real0,dim=0)
+            #real1=torch.stack(real1,dim=0)
+            
+            real_text=torch.stack(real_text,dim=0)
+
+
+            features1 = aug0 #torch.stack([aug0,aug1], dim=1)
+            features2 = tex_aug #torch.stack([tex_aug,tex_aug], dim=1)
+            features3 = torch.stack([real0,real_text], dim=1)
+
+            img_text_aug_feat = torch.cat([features1,features2], dim=0)
+            img_text_aug_feat = img_text_aug_feat.unsqueeze(0)
+            features3 = features3.unsqueeze(0)
+            vali_loss = 1.5*criterion(img_text_aug_feat)  + criterion(features3)
             _, validate_argmax = torch.max(validate_outputs, 1)
             validate_outputs, validate_labels = validate_outputs.to("cuda"), validate_labels.type(torch.LongTensor).to("cuda")
-            vali_loss = criterion(validate_outputs, validate_labels)
+            #vali_loss = criterion(validate_outputs, validate_labels)
             #domain_loss = criterion(domain_outputs, event_labels)
                 #_, labels = torch.max(validate_labels, 1)
             validate_accuracy = (validate_labels == validate_argmax.squeeze()).float().mean()
@@ -404,7 +605,7 @@ def main(args):
     for i, (test_data, test_labels, event_labels) in enumerate(test_loader):
         test_text, test_image, test_mask, test_labels = to_var(
             test_data[0]), to_var(test_data[1]), to_var(test_data[2]), to_var(test_labels)
-        test_outputs, domain_outputs= model(test_text, test_image, test_mask)
+        test_outputs, domain_outputs,txt,img= model(test_text, test_image, test_mask)
         _, test_argmax = torch.max(test_outputs, 1)
         if i == 0:
             test_score = to_np(test_outputs.squeeze())

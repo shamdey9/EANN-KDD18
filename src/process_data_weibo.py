@@ -1,5 +1,5 @@
 # encoding=utf-8
-import cPickle as pickle
+import pickle
 import random
 from random import *
 import numpy as np
@@ -21,12 +21,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import os.path
 from gensim.models import Word2Vec
 
-def stopwordslist(filepath = '../Data/weibo/stop_words.txt'):
+def stopwordslist(filepath = './data/weibo/stop_words.txt'):
     stopwords = {}
-    for line in open(filepath, 'r').readlines():
-        line = unicode(line, "utf-8").strip()
-        stopwords[line] = 1
-    #stopwords = [line.strip() for line in open(filepath, 'r', encoding='utf-8').readlines()]
+    '''for line in open(filepath, 'r').readlines():
+        line = io.unicode(line, 'utf-8').strip()
+        stopwords[line] = 1'''
+    stopwords = [line.strip() for line in open(filepath, 'r', encoding='utf-8').readlines()]
     return stopwords
 
 def clean_str_sst(string):
@@ -43,14 +43,24 @@ def clean_str_sst(string):
 #
 def read_image():
     image_list = {}
-    file_list = ['../Data/weibo/nonrumor_images/', '../Data/weibo/rumor_images/']
+    file_list = ['./data/weibo/nonrumor_images/', './data/weibo/rumor_images/']
     for path in file_list:
-        data_transforms = transforms.Compose([
+        data_transforms = transforms.Compose([transforms.Resize(size=224, max_size=None, antialias=None),
+            transforms.RandomCrop(224,224),
+            transforms.RandomHorizontalFlip(p=0.5),
+            # transforms.RandomRotation(10),
+            transforms.ColorJitter(),
+
+            # transforms.RandomResizedCrop(size=224,interpolation=bicubic),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+        ])
+        '''data_transforms = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            ])
+            ])'''
 
         for i, filename in enumerate(os.listdir(path)):  # assuming gif
 
@@ -67,7 +77,7 @@ def read_image():
     return image_list
 
 def write_txt(data):
-    f = open("../Data/weibo/top_n_data.txt", 'wb')
+    f = open("./data/weibo/top_n_data.txt", 'wb')
     for line in data:
         for l in line:
             f.write(l+"\n")
@@ -79,15 +89,16 @@ def write_data(flag, image, text_only):
 
     def read_post(flag):
         stop_words = stopwordslist()
-        pre_path = "../Data/weibo/tweets/"
+        pre_path = "./data/weibo/tweets/"
         file_list = [pre_path + "test_nonrumor.txt", pre_path + "test_rumor.txt", \
                          pre_path + "train_nonrumor.txt", pre_path + "train_rumor.txt"]
         if flag == "train":
-            id = pickle.load(open("../Data/weibo/train_id.pickle", 'rb'))
+            #open("./data/weibo/train_id.pickle_1", 'w', newline = '\n').write(open("./data/weibo/train_id.pickle", 'r').read())
+            id = pickle.load(open("./data/weibo/train_id.pickle", 'rb'))
         elif flag == "validate":
-            id = pickle.load(open("../Data/weibo/validate_id.pickle", 'rb'))
+            id = pickle.load(open("./data/weibo/validate_id.pickle", 'rb'))
         elif flag == "test":
-            id = pickle.load(open("../Data/weibo/test_id.pickle", 'rb'))
+            id = pickle.load(open("./data/weibo/test_id.pickle", 'rb'))
 
 
         post_content = []
@@ -121,8 +132,10 @@ def write_data(flag, image, text_only):
 
                 if (i + 1) % 3 == 1:
                     line_data = []
-                    twitter_id = l.split('|')[0]
+                    
+                    twitter_id = l.split(b'|')[0]
                     line_data.append(twitter_id)
+                    
 
 
 
@@ -131,7 +144,7 @@ def write_data(flag, image, text_only):
                     line_data.append(l.lower())
 
                 if (i + 1) % 3 == 0:
-                    l = clean_str_sst(unicode(l, "utf-8"))
+                    l = clean_str_sst(str(l, "utf-8"))
 
                     seg_list = jieba.cut_for_search(l)
                     new_seg_list = []
@@ -140,7 +153,9 @@ def write_data(flag, image, text_only):
                             new_seg_list.append(word)
 
                     clean_l = " ".join(new_seg_list)
-                    if len(clean_l) > 10 and line_data[0] in id:
+                    line_data[0] = line_data[0].decode('ASCII')
+                   
+                    if len(clean_l) > 10 and line_data[0] in id.keys():
                         post_content.append(l)
                         line_data.append(l)
                         line_data.append(clean_l)
@@ -158,9 +173,8 @@ def write_data(flag, image, text_only):
 
 
             f.close()
-            # print(data)
+            #print(data)
             #     return post_content
-        
         data_df = pd.DataFrame(np.array(data), columns=column)
         write_txt(top_data)
 
@@ -220,8 +234,8 @@ def write_data(flag, image, text_only):
 
                 label.append(post.iloc[i]['label'])
 
-        label = np.array(label, dtype=np.int)
-        ordered_event = np.array(ordered_event, dtype=np.int)
+        label = np.array(label, dtype=int)
+        ordered_event = np.array(ordered_event, dtype=int)
 
         print("Label number is " + str(len(label)))
         print("Rummor number is " + str(sum(label)))
@@ -389,9 +403,9 @@ def get_data(text_only):
 
     #
     #
-    word_embedding_path = "../Data/weibo/w2v.pickle"
+    word_embedding_path = "./data/weibo/w2v.pickle"
 
-    w2v = pickle.load(open(word_embedding_path, 'rb'))
+    w2v = pickle.load(open(word_embedding_path, 'rb'),encoding='latin-1')
     # print(temp)
     # #
     print("word2vec loaded!")
@@ -432,7 +446,7 @@ def get_data(text_only):
     # # rand_vecs = {}
     # # add_unknown_words(rand_vecs, vocab)
     W2 = rand_vecs = {}
-    w_file = open("../Data/weibo/word_embedding.pickle", "wb")
+    w_file = open("./data/weibo/word_embedding.pickle", "wb")
     pickle.dump([W, W2, word_idx_map, vocab, max_l], w_file)
     w_file.close()
     return train_data, valiate_data, test_data
